@@ -1,7 +1,7 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolNamespace } from "@earendil-works/pi-coding-agent";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -21,6 +21,21 @@ process.env.GH_NO_UPDATE_NOTIFIER = "1";
 process.env.GIT_TERMINAL_PROMPT = "0";
 process.env.GCM_INTERACTIVE = "Never";
 const JSON_HELP = "Comma-separated gh --json fields. Defaults chosen from gh docs for agent-friendly output.";
+
+const GH_NAMESPACE: ToolNamespace = {
+	name: "gh",
+	aliases: ["github", "gh-cli"],
+	description:
+		"Structured GitHub CLI (gh) tools: issues, pull requests, repos, Actions runs and workflows, releases, labels, search, secrets, variables, gists, raw REST/GraphQL API, and auth status.",
+	instructions: [
+		"Call these tools from codemode scripts: await tools.gh_pr({ action: 'view', number: '42' }).",
+		"Prefer them over bash gh commands: arguments are validated, built as safe arg arrays (no shell quoting), and results are JSON with truncation handled.",
+		"Read actions (list/view/checks/diff/search/get) run without confirmation. Mutation and destructive actions are confirmed by the user in the TUI before execution; a declined call returns an error naming the declined operation.",
+		"Pass repo=OWNER/REPO explicitly for any mutation outside the current git context.",
+		"Use fields to select gh --json fields; sensible defaults apply when omitted.",
+		"Independent calls can run in parallel: await Promise.all([tools.gh_issue({...}), tools.gh_pr({...})]).",
+	].join("\n"),
+};
 
 const ghIssueActions = ["list", "view", "create", "comment", "edit", "close", "reopen"] as const;
 const ghReleaseActions = ["list", "view", "create", "edit", "delete", "upload", "download"] as const;
@@ -46,6 +61,19 @@ function classifyAction(action: string): "read" | "local_mutation" | "github_mut
 	if (READ_ACTIONS.has(action)) return "read";
 	if (LOCAL_MUTATION_ACTIONS.has(action)) return "local_mutation";
 	return "github_mutation";
+}
+
+/**
+ * Pre-execution classification for the tool_call gate. Fails closed: an unknown or
+ * missing action is treated as a GitHub mutation.
+ */
+function gateClass(toolName: string, input: Record<string, unknown>): "read" | "local_mutation" | "github_mutation" | "destructive" {
+	if (toolName === "gh_search" || toolName === "gh_auth_status") return "read";
+	if (toolName === "gh_api") {
+		return (typeof input.method === "string" ? input.method : "GET") === "GET" ? "read" : "github_mutation";
+	}
+	const action = typeof input.action === "string" ? input.action : "";
+	return classifyAction(action);
 }
 
 function repoWarning(params: { repo?: string }, action: string): string | undefined {
@@ -118,7 +146,6 @@ const GhIssueParams = Type.Object({
 	addAssignee: Type.Optional(Type.Array(Type.String())),
 	removeAssignee: Type.Optional(Type.Array(Type.String())),
 	closeReason: Type.Optional(StringEnum(["completed", "not planned", "duplicate"] as const)),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 
 type GhIssueParamsT = Static<typeof GhIssueParams>;
@@ -157,7 +184,6 @@ const GhPrParams = Type.Object({
 	rebase: Type.Optional(Type.Boolean({ description: "For update_branch: rebase instead of merge update." })),
 	branch: Type.Optional(Type.String({ description: "For checkout: local branch name." })),
 	force: Type.Optional(Type.Boolean({ description: "For checkout: reset existing local branch." })),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 
 type GhPrParamsT = Static<typeof GhPrParams>;
@@ -188,7 +214,6 @@ const GhRepoParams = Type.Object({
 	enableWiki: Type.Optional(Type.Boolean()),
 	enableProjects: Type.Optional(Type.Boolean()),
 	deleteBranchOnMerge: Type.Optional(Type.Boolean()),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 
 type GhRepoParamsT = Static<typeof GhRepoParams>;
@@ -218,7 +243,6 @@ const GhRunParams = Type.Object({
 	name: Type.Optional(Type.Array(Type.String(), { description: "For download: artifact names." })),
 	pattern: Type.Optional(Type.Array(Type.String(), { description: "For download: artifact glob patterns." })),
 	interval: Type.Optional(Type.Number({ description: "For watch: seconds between refresh." })),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 
 type GhRunParamsT = Static<typeof GhRunParams>;
@@ -233,7 +257,6 @@ const GhWorkflowParams = Type.Object({
 	ref: Type.Optional(Type.String({ description: "Branch/tag ref for workflow run/view." })),
 	yaml: Type.Optional(Type.Boolean({ description: "For view: show workflow YAML." })),
 	field: Type.Optional(Type.Array(KeyValueParam, { description: "Workflow dispatch inputs, passed as -f key=value." })),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 
 type GhWorkflowParamsT = Static<typeof GhWorkflowParams>;
@@ -250,7 +273,6 @@ const GhApiParams = Type.Object({
 	slurp: Type.Optional(Type.Boolean()),
 	jq: Type.Optional(Type.String()),
 	cache: Type.Optional(Type.String({ description: "Cache duration, e.g. 60m." })),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 
 type GhApiParamsT = Static<typeof GhApiParams>;
@@ -276,7 +298,6 @@ const GhReleaseParams = Type.Object({
 	pattern: Type.Optional(Type.Array(Type.String(), { description: "Glob patterns for download." })),
 	dir: Type.Optional(Type.String({ description: "Directory for download." })),
 	archive: Type.Optional(StringEnum(["zip", "tar.gz"] as const)),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 type GhReleaseParamsT = Static<typeof GhReleaseParams>;
 
@@ -292,7 +313,6 @@ const GhLabelParams = Type.Object({
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
 	force: Type.Optional(Type.Boolean({ description: "For create: overwrite existing." })),
 	sourceRepo: Type.Optional(Type.String({ description: "For clone: source OWNER/REPO." })),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 type GhLabelParamsT = Static<typeof GhLabelParams>;
 
@@ -325,7 +345,6 @@ const GhSecretParams = Type.Object({
 	app: Type.Optional(StringEnum(["actions", "codespaces", "dependabot"] as const)),
 	visibility: Type.Optional(StringEnum(["all", "private", "selected"] as const)),
 	repos: Type.Optional(Type.Array(Type.String(), { description: "Selected repos for org secret visibility." })),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 type GhSecretParamsT = Static<typeof GhSecretParams>;
 
@@ -340,7 +359,6 @@ const GhVariableParams = Type.Object({
 	env: Type.Optional(Type.String()),
 	visibility: Type.Optional(StringEnum(["all", "private", "selected"] as const)),
 	repos: Type.Optional(Type.Array(Type.String())),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 type GhVariableParamsT = Static<typeof GhVariableParams>;
 
@@ -358,7 +376,6 @@ const GhGistParams = Type.Object({
 	removeFiles: Type.Optional(Type.Array(Type.String())),
 	dir: Type.Optional(Type.String({ description: "Target dir for clone." })),
 	raw: Type.Optional(Type.Boolean({ description: "For view: raw without rendering." })),
-	confirm: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Tools never prompt for confirmation." })),
 });
 type GhGistParamsT = Static<typeof GhGistParams>;
 
@@ -405,14 +422,6 @@ function enrichEnvelope(
 function targetText(value: string | undefined): string {
 	if (value === undefined || value === "") throw new Error("number/runId/workflow target is required for this action");
 	return value;
-}
-
-async function ensureNonInteractive(
-	_ctx: ExtensionContext,
-	_params: { confirm?: boolean },
-	_summary: string,
-): Promise<void> {
-	// Intentionally no-op: tools must never block on interactive confirmation.
 }
 
 async function formatResult(
@@ -515,12 +524,36 @@ function renderGhResult(result: any, { expanded, isPartial }: any, theme: any) {
 }
 
 export default function (pi: ExtensionAPI): void {
+	// Pre-execution gate: reads pass freely; every mutation/destructive/local change
+	// is confirmed in the TUI before gh runs. Fires for direct and nested (codemode)
+	// calls alike, since both go through the tool_call handler.
+	pi.on("tool_call", async (event, ctx) => {
+		if (!event.toolName.startsWith("gh_")) return;
+		const input = event.input as Record<string, unknown>;
+		const cls = gateClass(event.toolName, input);
+		if (cls === "read") return;
+		const action = typeof input.action === "string" ? input.action : typeof input.method === "string" ? input.method : "";
+		const target = [input.number, input.runId, input.workflow, input.tag, input.name, input.id, input.endpoint].find(
+			(v): v is string => typeof v === "string" && v !== "",
+		);
+		const repo = typeof input.repo === "string" ? input.repo : "current repo context";
+		const summary = `${event.toolName} ${action}${target ? ` ${target}` : ""} (${repo})`.trim();
+		const title =
+			cls === "destructive" ? "Destructive GitHub operation" :
+			cls === "local_mutation" ? "Local repository change" :
+			"GitHub mutation";
+		const ok = await ctx.ui.confirm(title, `Allow: ${summary}`);
+		if (!ok) return { block: true, reason: `User declined: ${summary}` };
+	});
+
 	pi.registerTool({
 		name: "gh_issue",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub issue",
 		description:
 			"Structured GitHub issue operations via gh. Supports list/view/create/comment/edit/close/reopen. Uses gh --json where possible. Output truncated to " +
-			`${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}. State-changing actions execute non-interactively and never prompt for confirmation.`,
+			`${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.`,
 		promptSnippet: "Structured GitHub issue operations via gh (list/view/create/comment/edit/close/reopen).",
 		promptGuidelines: [
 			"Use gh_issue instead of bash gh issue commands when interacting with GitHub issues.",
@@ -546,7 +579,6 @@ export default function (pi: ExtensionAPI): void {
 					addJson(args, params.fields, params.comments ? undefined : issueViewDefaultFields);
 					break;
 				case "create":
-					await ensureNonInteractive(ctx, params, `gh issue create ${params.title ?? ""}`);
 					if (!params.title) throw new Error("title is required for issue create");
 					args.push("--title", params.title);
 					addBody(args, params.body, params.bodyFile);
@@ -555,13 +587,11 @@ export default function (pi: ExtensionAPI): void {
 					addRepeated(args, "--assignee", params.addAssignee);
 					break;
 				case "comment":
-					await ensureNonInteractive(ctx, params, `gh issue comment ${targetText(params.number)}`);
 					if (!params.body && !params.bodyFile) throw new Error("body or bodyFile is required for issue comment");
 					args.push(targetText(params.number));
 					addBody(args, params.body, params.bodyFile);
 					break;
 				case "edit":
-					await ensureNonInteractive(ctx, params, `gh issue edit ${targetText(params.number)}`);
 					args.push(targetText(params.number));
 					if (params.title) args.push("--title", params.title);
 					addBody(args, params.body, params.bodyFile);
@@ -571,13 +601,11 @@ export default function (pi: ExtensionAPI): void {
 					addRepeated(args, "--remove-assignee", params.removeAssignee);
 					break;
 				case "close":
-					await ensureNonInteractive(ctx, params, `gh issue close ${targetText(params.number)}`);
 					args.push(targetText(params.number));
 					if (params.body) args.push("--comment", params.body);
 					if (params.closeReason) args.push("--reason", params.closeReason);
 					break;
 				case "reopen":
-					await ensureNonInteractive(ctx, params, `gh issue reopen ${targetText(params.number)}`);
 					args.push(targetText(params.number));
 					if (params.body) args.push("--comment", params.body);
 					break;
@@ -594,9 +622,11 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_pr",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub PR",
 		description:
-			"Structured GitHub pull request operations via gh. Supports list/view/checks/diff/create/comment/review/merge/close/reopen/ready/checkout/update_branch. Uses gh --json where possible. State-changing actions execute non-interactively and never prompt for confirmation.",
+			"Structured GitHub pull request operations via gh. Supports list/view/checks/diff/create/comment/review/merge/close/reopen/ready/checkout/update_branch. Uses gh --json where possible. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub PR operations via gh.",
 		promptGuidelines: [
 			"Use gh_pr instead of bash gh pr commands when interacting with pull requests.",
@@ -639,7 +669,6 @@ export default function (pi: ExtensionAPI): void {
 					args.push("--color", "never");
 					break;
 				case "create":
-					await ensureNonInteractive(ctx, params, `gh pr create ${params.title ?? ""}`);
 					if (!params.title && !params.fill) throw new Error("title or fill=true is required for pr create");
 					if (params.title) args.push("--title", params.title);
 					addBody(args, params.body, params.bodyFile);
@@ -652,13 +681,11 @@ export default function (pi: ExtensionAPI): void {
 					addRepeated(args, "--reviewer", params.reviewer);
 					break;
 				case "comment":
-					await ensureNonInteractive(ctx, params, `gh pr comment ${params.number ?? "current"}`);
 					if (params.number !== undefined) args.push(String(params.number));
 					if (!params.body && !params.bodyFile) throw new Error("body or bodyFile is required for pr comment");
 					addBody(args, params.body, params.bodyFile);
 					break;
 				case "review":
-					await ensureNonInteractive(ctx, params, `gh pr review ${params.number ?? "current"}`);
 					if (params.number !== undefined) args.push(String(params.number));
 					if (params.review === "approve") args.push("--approve");
 					else {
@@ -669,7 +696,6 @@ export default function (pi: ExtensionAPI): void {
 					addBody(args, params.body, params.bodyFile);
 					break;
 				case "merge":
-					await ensureNonInteractive(ctx, params, `gh pr merge ${params.number ?? "current"}`);
 					if (!params.mergeMethod && !params.auto) throw new Error("mergeMethod or auto=true is required for pr merge to avoid gh prompts");
 					if (params.number !== undefined) args.push(String(params.number));
 					if (params.mergeMethod) args.push(`--${params.mergeMethod}`);
@@ -679,20 +705,17 @@ export default function (pi: ExtensionAPI): void {
 					if (params.matchHeadCommit) args.push("--match-head-commit", params.matchHeadCommit);
 					break;
 				case "close":
-					await ensureNonInteractive(ctx, params, `gh pr close ${targetText(params.number)}`);
 					args.push(targetText(params.number));
 					if (params.body) args.push("--comment", params.body);
 					if (params.deleteBranch) args.push("--delete-branch");
 					break;
 				case "reopen":
-					await ensureNonInteractive(ctx, params, `gh pr reopen ${targetText(params.number)}`);
 					args.push(targetText(params.number));
 					if (params.body) args.push("--comment", params.body);
 					break;
 				case "ready":
 				case "checkout":
 				case "update_branch":
-					await ensureNonInteractive(ctx, params, `gh pr ${sub} ${params.number ?? "current"}`);
 					if (params.number !== undefined) args.push(String(params.number));
 					if (params.branch && params.action === "checkout") args.push("--branch", params.branch);
 					if (params.force && params.action === "checkout") args.push("--force");
@@ -718,8 +741,10 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_repo",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub repo",
-		description: "Structured GitHub repository operations via gh. Supports view/list/default/create/edit. State-changing actions execute non-interactively and never prompt for confirmation.",
+		description: "Structured GitHub repository operations via gh. Supports view/list/default/create/edit. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub repository operations via gh.",
 		promptGuidelines: ["Use gh_repo instead of bash gh repo commands for repository metadata and settings."],
 		parameters: GhRepoParams,
@@ -744,7 +769,6 @@ export default function (pi: ExtensionAPI): void {
 					else args.push("--view");
 					break;
 				case "create":
-					await ensureNonInteractive(ctx, params, `gh repo create ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for repo create");
 					if (!params.visibility) throw new Error("visibility is required for repo create to avoid gh prompts");
 					args.push(params.name);
@@ -759,7 +783,6 @@ export default function (pi: ExtensionAPI): void {
 					if (params.remote) args.push("--remote", params.remote);
 					break;
 				case "edit":
-					await ensureNonInteractive(ctx, params, `gh repo edit ${params.repo ?? "current"}`);
 					if (params.repo) args.push(params.repo);
 					if (params.description) args.push("--description", params.description);
 					if (params.homepage) args.push("--homepage", params.homepage);
@@ -788,8 +811,10 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_run",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub Actions run",
-		description: "Structured GitHub Actions run operations via gh. Supports list/view/watch/rerun/cancel/download. Logs are tail-truncated; state-changing/long actions execute non-interactively and never prompt for confirmation.",
+		description: "Structured GitHub Actions run operations via gh. Supports list/view/watch/rerun/cancel/download. Logs are tail-truncated; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub Actions run operations via gh.",
 		promptGuidelines: ["Use gh_run for Actions run lists, failed logs, reruns, and cancellation."],
 		parameters: GhRunParams,
@@ -818,25 +843,21 @@ export default function (pi: ExtensionAPI): void {
 					if (!params.log && !params.logFailed) addJson(args, params.fields, "databaseId,number,name,displayTitle,workflowName,event,status,conclusion,jobs,headBranch,headSha,createdAt,updatedAt,url");
 					break;
 				case "watch":
-					await ensureNonInteractive(ctx, params, `gh run watch ${targetText(params.runId)}`);
 					args.push(targetText(params.runId));
 					if (params.interval) args.push("--interval", String(params.interval));
 					if (params.exitStatus) args.push("--exit-status");
 					break;
 				case "rerun":
-					await ensureNonInteractive(ctx, params, `gh run rerun ${targetText(params.runId)}`);
 					args.push(targetText(params.runId));
 					if (params.failed) args.push("--failed");
 					if (params.debug) args.push("--debug");
 					if (params.job) args.push("--job", params.job);
 					break;
 				case "cancel":
-					await ensureNonInteractive(ctx, params, `gh run cancel ${targetText(params.runId)}`);
 					args.push(targetText(params.runId));
 					if (params.force) args.push("--force");
 					break;
 				case "download":
-					await ensureNonInteractive(ctx, params, `gh run download ${params.runId ?? "latest/current selection"}`);
 					if (params.runId === undefined) throw new Error("runId is required for run download to avoid gh prompts");
 					args.push(String(params.runId));
 					if (params.dir) args.push("--dir", params.dir);
@@ -863,8 +884,10 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_workflow",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub workflow",
-		description: "Structured GitHub Actions workflow operations via gh. Supports list/view/run/enable/disable. State-changing actions execute non-interactively and never prompt for confirmation.",
+		description: "Structured GitHub Actions workflow operations via gh. Supports list/view/run/enable/disable. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub workflow operations via gh.",
 		promptGuidelines: ["Use gh_workflow for listing, viewing, dispatching, enabling, and disabling Actions workflows."],
 		parameters: GhWorkflowParams,
@@ -884,14 +907,12 @@ export default function (pi: ExtensionAPI): void {
 					if (params.yaml) args.push("--yaml");
 					break;
 				case "run":
-					await ensureNonInteractive(ctx, params, `gh workflow run ${targetText(params.workflow)}`);
 					args.push(targetText(params.workflow));
 					if (params.ref) args.push("--ref", params.ref);
 					addKv(args, "--raw-field", params.field);
 					break;
 				case "enable":
 				case "disable":
-					await ensureNonInteractive(ctx, params, `gh workflow ${params.action} ${targetText(params.workflow)}`);
 					args.push(targetText(params.workflow));
 					break;
 			}
@@ -907,9 +928,11 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_api",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub API",
 		description:
-			"Structured gh api wrapper. Builds argument arrays (no shell quoting), supports method/fields/headers/previews/pagination/jq/cache. Non-GET methods execute non-interactively and never prompt for confirmation.",
+			"Structured gh api wrapper. Builds argument arrays (no shell quoting), supports method/fields/headers/previews/pagination/jq/cache. Non-GET methods are confirmed in the TUI before execution.",
 		promptSnippet: "Authenticated GitHub REST/GraphQL requests through gh api.",
 		promptGuidelines: [
 			"Use gh_api for GitHub endpoints not covered by gh_issue, gh_pr, gh_repo, gh_run, or gh_workflow.",
@@ -918,7 +941,6 @@ export default function (pi: ExtensionAPI): void {
 		parameters: GhApiParams,
 		async execute(_id, params: GhApiParamsT, _signal, _onUpdate, ctx) {
 			const method = params.method ?? "GET";
-			if (method !== "GET") await ensureNonInteractive(ctx, params, `gh api -X ${method} ${params.endpoint}`);
 			const args = ["api", params.endpoint, "--method", method];
 			if (params.hostname) args.push("--hostname", params.hostname);
 			if (params.paginate) args.push("--paginate");
@@ -947,8 +969,10 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_release",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub release",
-		description: "Structured GitHub release operations via gh. Supports list/view/create/edit/delete/upload/download. State-changing actions execute non-interactively and never prompt for confirmation.",
+		description: "Structured GitHub release operations via gh. Supports list/view/create/edit/delete/upload/download. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub release operations via gh.",
 		promptGuidelines: [
 			"Use gh_release instead of bash gh release commands.",
@@ -969,7 +993,6 @@ export default function (pi: ExtensionAPI): void {
 					addJson(args, params.fields, releaseViewDefaultFields);
 					break;
 				case "create":
-					await ensureNonInteractive(ctx, params, `gh release create ${params.tag ?? ""}`);
 					if (!params.tag) throw new Error("tag is required for release create");
 					args.push(params.tag);
 					if (params.title) args.push("--title", params.title);
@@ -986,7 +1009,6 @@ export default function (pi: ExtensionAPI): void {
 					for (const a of params.assets ?? []) args.push(a);
 					break;
 				case "edit":
-					await ensureNonInteractive(ctx, params, `gh release edit ${params.tag ?? ""}`);
 					if (!params.tag) throw new Error("tag is required for release edit");
 					args.push(params.tag);
 					if (params.title) args.push("--title", params.title);
@@ -999,12 +1021,10 @@ export default function (pi: ExtensionAPI): void {
 					if (params.discussionCategory) args.push("--discussion-category", params.discussionCategory);
 					break;
 				case "delete":
-					await ensureNonInteractive(ctx, params, `gh release delete ${params.tag ?? ""}`);
 					if (!params.tag) throw new Error("tag is required for release delete");
 					args.push(params.tag, "--yes");
 					break;
 				case "upload":
-					await ensureNonInteractive(ctx, params, `gh release upload ${params.tag ?? ""}`);
 					if (!params.tag) throw new Error("tag is required for release upload");
 					args.push(params.tag);
 					if (!params.assets?.length) throw new Error("assets are required for release upload");
@@ -1012,7 +1032,6 @@ export default function (pi: ExtensionAPI): void {
 					if (params.clobber) args.push("--clobber");
 					break;
 				case "download":
-					await ensureNonInteractive(ctx, params, `gh release download ${params.tag ?? "latest"}`);
 					if (params.tag) args.push(params.tag);
 					if (params.dir) args.push("--dir", params.dir);
 					addRepeated(args, "--pattern", params.pattern);
@@ -1032,8 +1051,10 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_label",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub label",
-		description: "Structured GitHub label operations via gh. Supports list/create/edit/delete/clone. State-changing actions execute non-interactively and never prompt for confirmation.",
+		description: "Structured GitHub label operations via gh. Supports list/create/edit/delete/clone. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub label operations via gh.",
 		promptGuidelines: ["Use gh_label for label CRUD; do not parse human gh label list output."],
 		parameters: GhLabelParams,
@@ -1047,7 +1068,6 @@ export default function (pi: ExtensionAPI): void {
 					addJson(args, params.fields, labelDefaultFields);
 					break;
 				case "create":
-					await ensureNonInteractive(ctx, params, `gh label create ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for label create");
 					args.push(params.name);
 					if (params.color) args.push("--color", params.color);
@@ -1055,7 +1075,6 @@ export default function (pi: ExtensionAPI): void {
 					if (params.force) args.push("--force");
 					break;
 				case "edit":
-					await ensureNonInteractive(ctx, params, `gh label edit ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for label edit");
 					args.push(params.name);
 					if (params.newName) args.push("--name", params.newName);
@@ -1063,12 +1082,10 @@ export default function (pi: ExtensionAPI): void {
 					if (params.description) args.push("--description", params.description);
 					break;
 				case "delete":
-					await ensureNonInteractive(ctx, params, `gh label delete ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for label delete");
 					args.push(params.name, "--yes");
 					break;
 				case "clone":
-					await ensureNonInteractive(ctx, params, `gh label clone from ${params.sourceRepo ?? ""}`);
 					if (!params.sourceRepo) throw new Error("sourceRepo is required for label clone");
 					args.push(params.sourceRepo);
 					if (params.force) args.push("--force");
@@ -1086,6 +1103,9 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_search",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
+		annotations: { readOnlyHint: true },
 		label: "GitHub search",
 		description: "Structured gh search wrapper across repos/issues/prs/code/commits. Read-only; uses gh --json fields where supported.",
 		promptSnippet: "Search GitHub via gh search (repos/issues/prs/code/commits).",
@@ -1125,6 +1145,8 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_secret",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub secret",
 		description: "Structured GitHub Actions/Codespaces/Dependabot secret operations via gh. Supports list/set/delete. Values are write-only; reads are not possible.",
 		promptSnippet: "Structured GitHub secret operations via gh.",
@@ -1143,7 +1165,6 @@ export default function (pi: ExtensionAPI): void {
 				case "list":
 					break;
 				case "set":
-					await ensureNonInteractive(ctx, params, `gh secret set ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for secret set");
 					args.push(params.name);
 					if (params.body && params.bodyFile) throw new Error("Provide either body or bodyFile, not both");
@@ -1154,7 +1175,6 @@ export default function (pi: ExtensionAPI): void {
 					addRepeated(args, "--repos", params.repos);
 					break;
 				case "delete":
-					await ensureNonInteractive(ctx, params, `gh secret delete ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for secret delete");
 					args.push(params.name);
 					break;
@@ -1171,6 +1191,8 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_variable",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub variable",
 		description: "Structured GitHub Actions variable operations via gh. Supports list/get/set/delete.",
 		promptSnippet: "Structured GitHub variable operations via gh.",
@@ -1188,7 +1210,6 @@ export default function (pi: ExtensionAPI): void {
 					args.push(params.name);
 					break;
 				case "set":
-					await ensureNonInteractive(ctx, params, `gh variable set ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for variable set");
 					args.push(params.name);
 					if (params.body && params.bodyFile) throw new Error("Provide either body or bodyFile, not both");
@@ -1199,7 +1220,6 @@ export default function (pi: ExtensionAPI): void {
 					addRepeated(args, "--repos", params.repos);
 					break;
 				case "delete":
-					await ensureNonInteractive(ctx, params, `gh variable delete ${params.name ?? ""}`);
 					if (!params.name) throw new Error("name is required for variable delete");
 					args.push(params.name);
 					break;
@@ -1216,8 +1236,10 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_gist",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
 		label: "GitHub gist",
-		description: "Structured GitHub gist operations via gh. Supports list/view/create/edit/delete/clone. State-changing actions execute non-interactively and never prompt for confirmation.",
+		description: "Structured GitHub gist operations via gh. Supports list/view/create/edit/delete/clone. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub gist operations via gh.",
 		parameters: GhGistParams,
 		async execute(_id, params: GhGistParamsT, _signal, _onUpdate, ctx) {
@@ -1236,14 +1258,12 @@ export default function (pi: ExtensionAPI): void {
 					if (params.raw) args.push("--raw");
 					break;
 				case "create":
-					await ensureNonInteractive(ctx, params, "gh gist create");
 					if (!params.files?.length) throw new Error("files are required for gist create");
 					for (const f of params.files) args.push(f);
 					if (params.description) args.push("--desc", params.description);
 					if (params.public) args.push("--public");
 					break;
 				case "edit":
-					await ensureNonInteractive(ctx, params, `gh gist edit ${params.id ?? ""}`);
 					if (!params.id) throw new Error("id is required for gist edit");
 					args.push(params.id);
 					if (params.description) args.push("--desc", params.description);
@@ -1252,12 +1272,10 @@ export default function (pi: ExtensionAPI): void {
 					addRepeated(args, "--remove", params.removeFiles);
 					break;
 				case "delete":
-					await ensureNonInteractive(ctx, params, `gh gist delete ${params.id ?? ""}`);
 					if (!params.id) throw new Error("id is required for gist delete");
 					args.push(params.id, "--yes");
 					break;
 				case "clone":
-					await ensureNonInteractive(ctx, params, `gh gist clone ${params.id ?? ""}`);
 					if (!params.id) throw new Error("id is required for gist clone");
 					args.push(params.id);
 					if (params.dir) args.push(params.dir);
@@ -1275,6 +1293,9 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "gh_auth_status",
+		exposure: "codemode",
+		namespace: GH_NAMESPACE,
+		annotations: { readOnlyHint: true },
 		label: "GitHub auth status",
 		description: "Read-only gh auth status wrapper. Never shows tokens.",
 		promptSnippet: "Check gh authentication status without exposing tokens.",

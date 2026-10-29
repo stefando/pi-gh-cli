@@ -1,6 +1,6 @@
 # pi-gh-cli
 
-Structured GitHub CLI (`gh`) tools for Pi agents.
+Structured GitHub CLI (`gh`) tools for Pi agents, exposed through **codemode** with a pre-execution confirmation **gate** for mutations.
 
 ## Install
 
@@ -14,15 +14,20 @@ Or try without installing:
 pi -e npm:pi-gh-cli
 ```
 
-Requires GitHub CLI:
+Requires GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/cli.md#enable-codemode) — the tools are registered with `codemode` exposure, so the model reaches them from codemode scripts rather than as declared tools.
 
-```bash
-gh auth login
-```
+## How it works
 
-## Tools (Layer 1 primitives)
+- **Near-zero context cost.** The 13 tools are not declared in the system prompt. They are listed under the `gh` namespace in the codemode description and discoverable via `searchTools()` / `describeTool()` / `describeNamespace("gh")`.
+- **Called from scripts.** `await tools.gh_pr({ action: "view", number: "42" })`. Independent calls can run in parallel with `Promise.all`.
+- **Validation and safe argv.** Arguments are validated against TypeBox schemas and built into `gh` arg arrays — no shell quoting, no interactive prompts (`GH_PROMPT_DISABLED=1`, required flags enforced).
+- **Pre-execution gate.** A `tool_call` handler classifies every call before `gh` runs:
+  - reads (`list`/`view`/`checks`/`diff`/`search`/`get`, `gh_api` GET, `gh_search`, `gh_auth_status`) pass freely;
+  - mutations, local changes (`checkout`, `update_branch`, downloads/clones), and destructive actions (`delete`) are confirmed in the TUI with the exact tool, action, target, and repo; a decline blocks the call and returns `User declined: ...` to the model.
+  - classification fails closed: an unknown action is treated as a mutation.
+  - the gate fires for nested (codemode-script) calls too, since they go through the same `tool_call` handler.
 
-One tool per GitHub resource. Agent owns orchestration.
+## Tools (namespace `gh`)
 
 - `gh_issue` — list/view/create/comment/edit/close/reopen issues
 - `gh_pr` — list/view/checks/diff/create/comment/review/merge/close/reopen/ready/checkout/update_branch PRs
@@ -54,19 +59,24 @@ Each tool returns:
 
 - Argument arrays, no shell quoting.
 - Defaults to `gh --json` fields where available; pass `fields=` to override.
-- Tools never request interactive confirmation. State-changing actions run non-interactively when invoked.
+- Tools never block on interactive prompts; the user-facing confirmation happens pre-execution in the gate, not inside the tool.
 - Prompt-prone actions validate required args or pass blank bodies/notes rather than opening editors.
-- Destructive actions (`delete`) auto-pass `--yes`; caller intent gates tool invocation.
+- Destructive actions (`delete`) auto-pass `--yes`; the gate confirms them first.
 - Each `gh` process has a bounded timeout. Full output saved to a temp file when truncated.
 - Bodies/notes/secrets accept `bodyFile` / `notesFile` to avoid shell quoting and accidental logging.
+- The gate confirms mutations but does not verify intent: passing the wrong `repo` is still possible, so pass `repo=OWNER/REPO` explicitly for mutations.
 
 ## Agent usage patterns
 
-Read before write:
+From a codemode script, read before write:
 
-1. `gh_pr` `action=view` with `fields=number,title,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup,headRefOid`
-2. Decide based on returned state.
-3. `gh_pr` `action=merge` with `mergeMethod=squash` and `matchHeadCommit=<headRefOid>`.
+```js
+const pr = await tools.gh_pr({ action: "view", number: "42",
+  fields: "number,title,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup,headRefOid" });
+// decide based on returned state; the merge will trigger the user confirmation gate
+const merged = await tools.gh_pr({ action: "merge", number: "42",
+  mergeMethod: "squash", matchHeadCommit: "<headRefOid>" });
+```
 
 Always pass `repo=OWNER/REPO` for mutations to avoid current-directory inference.
 
