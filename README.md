@@ -21,6 +21,8 @@ Requires GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/
 - **Near-zero context cost.** The 13 tools are not declared in the system prompt. They are listed under the `gh` namespace in the codemode description and discoverable via `searchTools()` / `describeTool()` / `describeNamespace("gh")`.
 - **Called from scripts.** `await tools.gh_pr({ action: "view", number: "42" })`. Independent calls can run in parallel with `Promise.all`.
 - **Validation and safe argv.** Arguments are validated against TypeBox schemas and built into `gh` arg arrays — no shell quoting, no interactive prompts (`GH_PROMPT_DISABLED=1`, required flags enforced).
+- **Output shaping.** Every `--json` command accepts `jq` (applied by gh before output reaches context) and `fields`; pass `fields='*'` to list all available fields for a command. List results that come back exactly at `limit` get a truncation warning, since gh caps lists silently.
+- **Search queries** use gh's token model: qualifiers as separate tokens (`repo:cli/cli is:open`), double quotes mark phrases and multi-word qualifier values (`"broken feature"`, `label:"help wanted"`), negative qualifiers work (`-label:wontfix`); tokens are appended after `--` so they can never be parsed as flags.
 - **Pre-execution gate.** A `tool_call` handler classifies every call before `gh` runs:
   - reads (`list`/`view`/`checks`/`diff`/`search`/`get`, `gh_api` GET, `gh_search`, `gh_auth_status`) pass freely;
   - mutations, local changes (`checkout`, `update_branch`, downloads/clones), and destructive actions (`delete`) are confirmed in the TUI with the exact tool, action, target, and repo; a decline blocks the call and returns `User declined: ...` to the model.

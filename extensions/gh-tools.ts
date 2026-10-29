@@ -20,7 +20,8 @@ process.env.GH_PROMPT_DISABLED = "1";
 process.env.GH_NO_UPDATE_NOTIFIER = "1";
 process.env.GIT_TERMINAL_PROMPT = "0";
 process.env.GCM_INTERACTIVE = "Never";
-const JSON_HELP = "Comma-separated gh --json fields. Defaults chosen from gh docs for agent-friendly output.";
+const JSON_HELP = "Comma-separated gh --json fields. Defaults chosen from gh docs for agent-friendly output. Pass '*' to list every available field for the command.";
+const JQ_HELP = "jq expression applied to the JSON output (gh --jq). Use to shape or filter before it reaches context, e.g. '.[] | {number, title}'.";
 
 const GH_NAMESPACE: ToolNamespace = {
 	name: "gh",
@@ -32,7 +33,8 @@ const GH_NAMESPACE: ToolNamespace = {
 		"Prefer them over bash gh commands: arguments are validated, built as safe arg arrays (no shell quoting), and results are JSON with truncation handled.",
 		"Read actions (list/view/checks/diff/search/get) run without confirmation. Mutation and destructive actions are confirmed by the user in the TUI before execution; a declined call returns an error naming the declined operation.",
 		"Pass repo=OWNER/REPO explicitly for any mutation outside the current git context.",
-		"Use fields to select gh --json fields; sensible defaults apply when omitted.",
+		"Use fields to select gh --json fields; sensible defaults apply when omitted. Pass fields='*' to list every available field for a command.",
+		"Use jq to shape or filter JSON output before it reaches context.",
 		"Independent calls can run in parallel: await Promise.all([tools.gh_issue({...}), tools.gh_pr({...})]).",
 	].join("\n"),
 };
@@ -137,6 +139,7 @@ const GhIssueParams = Type.Object({
 	assignee: Type.Optional(Type.String()),
 	author: Type.Optional(Type.String()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	comments: Type.Optional(Type.Boolean({ description: "Include comments for view." })),
 	title: Type.Optional(Type.String({ description: "Title for create/edit." })),
 	body: Type.Optional(Type.String({ description: "Body/comment text." })),
@@ -163,6 +166,7 @@ const GhPrParams = Type.Object({
 	base: Type.Optional(Type.String()),
 	head: Type.Optional(Type.String()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	comments: Type.Optional(Type.Boolean({ description: "Include comments for view." })),
 	title: Type.Optional(Type.String({ description: "Title for create/edit/revert." })),
 	body: Type.Optional(Type.String({ description: "Body/comment/review text." })),
@@ -194,6 +198,7 @@ const GhRepoParams = Type.Object({
 	owner: Type.Optional(Type.String({ description: "Owner for repo list." })),
 	limit: Type.Optional(Type.Number()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	branch: Type.Optional(Type.String()),
 	visibility: Type.Optional(StringEnum(["public", "private", "internal"] as const)),
 	language: Type.Optional(Type.String()),
@@ -224,6 +229,7 @@ const GhRunParams = Type.Object({
 	runId: Type.Optional(Type.String({ description: "Workflow run database ID." })),
 	limit: Type.Optional(Type.Number()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	branch: Type.Optional(Type.String()),
 	commit: Type.Optional(Type.String()),
 	workflow: Type.Optional(Type.String()),
@@ -253,6 +259,7 @@ const GhWorkflowParams = Type.Object({
 	workflow: Type.Optional(Type.String({ description: "Workflow ID, name, or filename." })),
 	limit: Type.Optional(Type.Number()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	all: Type.Optional(Type.Boolean({ description: "Include disabled workflows for list." })),
 	ref: Type.Optional(Type.String({ description: "Branch/tag ref for workflow run/view." })),
 	yaml: Type.Optional(Type.Boolean({ description: "For view: show workflow YAML." })),
@@ -283,6 +290,7 @@ const GhReleaseParams = Type.Object({
 	tag: Type.Optional(Type.String({ description: "Release tag, e.g. v1.2.3." })),
 	limit: Type.Optional(Type.Number()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	title: Type.Optional(Type.String()),
 	notes: Type.Optional(Type.String()),
 	notesFile: Type.Optional(Type.String({ description: "Path to release notes file." })),
@@ -311,6 +319,7 @@ const GhLabelParams = Type.Object({
 	limit: Type.Optional(Type.Number()),
 	search: Type.Optional(Type.String()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	force: Type.Optional(Type.Boolean({ description: "For create: overwrite existing." })),
 	sourceRepo: Type.Optional(Type.String({ description: "For clone: source OWNER/REPO." })),
 });
@@ -318,9 +327,11 @@ type GhLabelParamsT = Static<typeof GhLabelParams>;
 
 const GhSearchParams = Type.Object({
 	scope: StringEnum(ghSearchScopes),
-	query: Type.String({ description: "Search query string. Same syntax as gh search." }),
+	query: Type.String({ description: "GitHub search query: qualifiers as separate tokens (repo:cli/cli is:open); double-quote phrases and multi-word qualifier values (\"broken feature\", label:\"help wanted\"). Negative qualifiers like -label:wontfix are supported." }),
 	limit: Type.Optional(Type.Number()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
+	searchType: Type.Optional(StringEnum(["lexical", "semantic", "hybrid"] as const, { description: "Issues only (github.com/GHEC): lexical (default); semantic for natural-language queries; hybrid blends both. Incompatible with sort/order." })),
 	owner: Type.Optional(Type.Array(Type.String())),
 	repo: Type.Optional(Type.Array(Type.String())),
 	language: Type.Optional(Type.String()),
@@ -367,6 +378,7 @@ const GhGistParams = Type.Object({
 	id: Type.Optional(Type.String({ description: "Gist ID or URL." })),
 	limit: Type.Optional(Type.Number()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
+	jq: Type.Optional(Type.String({ description: JQ_HELP })),
 	public: Type.Optional(Type.Boolean()),
 	secret: Type.Optional(Type.Boolean()),
 	description: Type.Optional(Type.String()),
@@ -383,9 +395,28 @@ function addRepo(args: string[], repo?: string): void {
 	if (repo) args.push("--repo", repo);
 }
 
-function addJson(args: string[], fields?: string, fallback?: string): void {
+function addJson(args: string[], fields?: string, fallback?: string, jq?: string): void {
 	const selected = fields ?? fallback;
-	if (selected) args.push("--json", selected);
+	if (selected === "*") args.push("--json");
+	else if (selected) args.push("--json", selected);
+	if (jq && selected) args.push("--jq", jq);
+}
+
+/** Merges a comments request into an explicit --json field list (structured output requires --json ...,comments). */
+function viewFields(fields: string | undefined, comments: boolean | undefined, defaults: string): string {
+	if (fields === "*") return fields; // discovery mode: bare --json lists fields; comments do not apply
+	if (comments && fields && !fields.split(",").some((f) => f.trim() === "comments")) return `${fields},comments`;
+	return fields ?? defaults;
+}
+
+/**
+ * Splits a search query into argv tokens. gh treats each positional argument as one keyword or
+ * qualifier and re-quotes it when building the search string, so double quotes mark phrase
+ * boundaries here and are stripped (gh adds them back): `repo:cli/cli is:open "broken feature"
+ * label:"help wanted"` -> [`repo:cli/cli`, `is:open`, `broken feature`, `label:help wanted`].
+ */
+function tokenizeQuery(query: string): string[] {
+	return [...query.matchAll(/[\w./-]+:"[^"]*"|"[^"]*"|\S+/g)].map((m) => m[0].replace(/"([^"]*)"/g, "$1"));
 }
 
 function addLimit(args: string[], limit?: number): void {
@@ -411,7 +442,8 @@ function enrichEnvelope(
 	opts: { action: string; repo?: string; nextSuggested?: string[]; warnings?: string[] },
 ): void {
 	const actionClass = classifyAction(opts.action);
-	const warnings = [...(opts.warnings ?? [])];
+	// Preserve warnings set earlier in the pipeline (e.g. the limit-truncation warning from execGh).
+	const warnings = [...((result.details.warnings as string[] | undefined) ?? []), ...(opts.warnings ?? [])];
 	const repoWarn = repoWarning({ repo: opts.repo }, opts.action);
 	if (repoWarn) warnings.push(repoWarn);
 	result.details.actionClass = actionClass;
@@ -470,7 +502,7 @@ async function execGh(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	args: string[],
-	options: { timeout?: number; mode?: "head" | "tail" } = {},
+	options: { timeout?: number; mode?: "head" | "tail"; limit?: number } = {},
 ) {
 	const result = await pi.exec("gh", args, {
 		cwd: ctx.cwd,
@@ -481,7 +513,14 @@ async function execGh(
 		const message = result.stderr.trim() || result.stdout.trim() || `gh exited ${result.code}`;
 		throw new Error(message);
 	}
-	return formatResult(result.stdout, result.stderr, args, options.mode);
+	const formatted = await formatResult(result.stdout, result.stderr, args, options.mode);
+	// List commands cap results silently and expose no totalCount; flag the likely-truncation case.
+	if (options.limit !== undefined && Array.isArray(formatted.details.parsed) && formatted.details.parsed.length >= options.limit) {
+		const warnings = [...((formatted.details.warnings as string[] | undefined) ?? [])];
+		warnings.push(`Result count (${formatted.details.parsed.length}) equals limit; more items may exist. Raise limit or paginate via gh_api --paginate.`);
+		formatted.details.warnings = warnings;
+	}
+	return formatted;
 }
 
 async function execGhAllowNonzero(
@@ -571,12 +610,11 @@ export default function (pi: ExtensionAPI): void {
 					if (params.assignee) args.push("--assignee", params.assignee);
 					if (params.author) args.push("--author", params.author);
 					addRepeated(args, "--label", params.label);
-					addJson(args, params.fields, issueDefaultFields);
+					addJson(args, params.fields, issueDefaultFields, params.jq);
 					break;
 				case "view":
 					args.push(targetText(params.number));
-					if (params.comments) args.push("--comments");
-					addJson(args, params.fields, params.comments ? undefined : issueViewDefaultFields);
+					addJson(args, viewFields(params.fields, params.comments, issueViewDefaultFields), undefined, params.jq);
 					break;
 				case "create":
 					if (!params.title) throw new Error("title is required for issue create");
@@ -610,7 +648,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.body) args.push("--comment", params.body);
 					break;
 			}
-			const result = await execGh(pi, ctx, args);
+			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
 			return result;
 		},
@@ -648,19 +686,18 @@ export default function (pi: ExtensionAPI): void {
 					if (params.base) args.push("--base", params.base);
 					if (params.head) args.push("--head", params.head);
 					addRepeated(args, "--label", params.label);
-					addJson(args, params.fields, prDefaultFields);
+					addJson(args, params.fields, prDefaultFields, params.jq);
 					break;
 				case "view":
 					if (params.number !== undefined) args.push(String(params.number));
-					if (params.comments) args.push("--comments");
-					addJson(args, params.fields, params.comments ? undefined : prViewDefaultFields);
+					addJson(args, viewFields(params.fields, params.comments, prViewDefaultFields), undefined, params.jq);
 					break;
 				case "checks":
 					if (params.number !== undefined) args.push(String(params.number));
 					if (params.required) args.push("--required");
 					if (params.watch) args.push("--watch");
 					if (params.failFast) args.push("--fail-fast");
-					if (!params.watch) addJson(args, params.fields, "name,workflow,state,completedAt,link,bucket");
+					if (!params.watch) addJson(args, params.fields, "name,workflow,state,completedAt,link,bucket", params.jq);
 					break;
 				case "diff":
 					if (params.number !== undefined) args.push(String(params.number));
@@ -729,7 +766,7 @@ export default function (pi: ExtensionAPI): void {
 			if (params.action === "merge" && !params.matchHeadCommit) {
 				nextSuggested.push("For race-safe merges, pass matchHeadCommit=<headRefOid> from prior view");
 			}
-			const result = await execGh(pi, ctx, args, { mode: params.action === "diff" ? "tail" : "head" });
+			const result = await execGh(pi, ctx, args, { mode: params.action === "diff" ? "tail" : "head", limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo, nextSuggested });
 			return result;
 		},
@@ -754,7 +791,7 @@ export default function (pi: ExtensionAPI): void {
 				case "view":
 					if (params.repo) args.push(params.repo);
 					if (params.branch) args.push("--branch", params.branch);
-					addJson(args, params.fields, repoDefaultFields);
+					addJson(args, params.fields, repoDefaultFields, params.jq);
 					break;
 				case "list":
 					if (params.owner) args.push(params.owner);
@@ -762,7 +799,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.visibility) args.push("--visibility", params.visibility);
 					if (params.language) args.push("--language", params.language);
 					addRepeated(args, "--topic", params.topic);
-					addJson(args, params.fields, repoDefaultFields);
+					addJson(args, params.fields, repoDefaultFields, params.jq);
 					break;
 				case "default":
 					if (params.repo) args.push(params.repo);
@@ -799,7 +836,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.deleteBranchOnMerge) args.push("--delete-branch-on-merge");
 					break;
 			}
-			const result = await execGh(pi, ctx, args);
+			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
 			return result;
 		},
@@ -830,7 +867,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.status) args.push("--status", params.status);
 					if (params.event) args.push("--event", params.event);
 					if (params.user) args.push("--user", params.user);
-					addJson(args, params.fields, runDefaultFields);
+					addJson(args, params.fields, runDefaultFields, params.jq);
 					break;
 				case "view":
 					if (params.runId !== undefined) args.push(String(params.runId));
@@ -840,7 +877,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.logFailed) args.push("--log-failed");
 					if (params.verbose) args.push("--verbose");
 					if (params.exitStatus) args.push("--exit-status");
-					if (!params.log && !params.logFailed) addJson(args, params.fields, "databaseId,number,name,displayTitle,workflowName,event,status,conclusion,jobs,headBranch,headSha,createdAt,updatedAt,url");
+					if (!params.log && !params.logFailed) addJson(args, params.fields, "databaseId,number,name,displayTitle,workflowName,event,status,conclusion,jobs,headBranch,headSha,createdAt,updatedAt,url", params.jq);
 					break;
 				case "watch":
 					args.push(targetText(params.runId));
@@ -872,6 +909,7 @@ export default function (pi: ExtensionAPI): void {
 			const result = await execGh(pi, ctx, args, {
 				timeout: COMMON_TIMEOUT_MS,
 				mode: params.log || params.logFailed || params.action === "watch" ? "tail" : "head",
+				limit: params.limit,
 			});
 			enrichEnvelope(result, { action: params.action, repo: params.repo, nextSuggested });
 			return result;
@@ -898,7 +936,7 @@ export default function (pi: ExtensionAPI): void {
 				case "list":
 					addLimit(args, params.limit);
 					if (params.all) args.push("--all");
-					addJson(args, params.fields, workflowDefaultFields);
+					addJson(args, params.fields, workflowDefaultFields, params.jq);
 					break;
 				case "view":
 					if (!params.workflow) throw new Error("workflow is required for workflow view to avoid gh prompts");
@@ -916,7 +954,7 @@ export default function (pi: ExtensionAPI): void {
 					args.push(targetText(params.workflow));
 					break;
 			}
-			const result = await execGh(pi, ctx, args, { mode: "head" });
+			const result = await execGh(pi, ctx, args, { mode: "head", limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
 			return result;
 		},
@@ -986,11 +1024,11 @@ export default function (pi: ExtensionAPI): void {
 			switch (sub) {
 				case "list":
 					addLimit(args, params.limit);
-					addJson(args, params.fields, releaseDefaultFields);
+					addJson(args, params.fields, releaseDefaultFields, params.jq);
 					break;
 				case "view":
 					if (params.tag) args.push(params.tag);
-					addJson(args, params.fields, releaseViewDefaultFields);
+					addJson(args, params.fields, releaseViewDefaultFields, params.jq);
 					break;
 				case "create":
 					if (!params.tag) throw new Error("tag is required for release create");
@@ -1039,7 +1077,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.clobber) args.push("--clobber");
 					break;
 			}
-			const result = await execGh(pi, ctx, args);
+			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: sub, repo: params.repo });
 			return result;
 		},
@@ -1065,7 +1103,7 @@ export default function (pi: ExtensionAPI): void {
 				case "list":
 					addLimit(args, params.limit);
 					if (params.search) args.push("--search", params.search);
-					addJson(args, params.fields, labelDefaultFields);
+					addJson(args, params.fields, labelDefaultFields, params.jq);
 					break;
 				case "create":
 					if (!params.name) throw new Error("name is required for label create");
@@ -1091,7 +1129,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.force) args.push("--force");
 					break;
 			}
-			const result = await execGh(pi, ctx, args);
+			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
 			return result;
 		},
@@ -1115,7 +1153,7 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: GhSearchParams,
 		async execute(_id, params: GhSearchParamsT, _signal, _onUpdate, ctx) {
-			const args = ["search", params.scope, params.query];
+			const args = ["search", params.scope];
 			addLimit(args, params.limit);
 			addRepeated(args, "--owner", params.owner);
 			addRepeated(args, "--repo", params.repo);
@@ -1124,6 +1162,7 @@ export default function (pi: ExtensionAPI): void {
 			if (params.author) args.push("--author", params.author);
 			if (params.assignee) args.push("--assignee", params.assignee);
 			addRepeated(args, "--label", params.label);
+			if (params.searchType) args.push("--search-type", params.searchType);
 			if (params.sort) args.push("--sort", params.sort);
 			if (params.order) args.push("--order", params.order);
 			const fallback =
@@ -1132,8 +1171,10 @@ export default function (pi: ExtensionAPI): void {
 				params.scope === "prs" ? searchPrDefaultFields :
 				params.scope === "commits" ? searchCommitDefaultFields :
 				undefined;
-			if (params.scope !== "code") addJson(args, params.fields, fallback);
-			const result = await execGh(pi, ctx, args);
+			if (params.scope !== "code") addJson(args, params.fields, fallback, params.jq);
+			// `--` separates query tokens from flags so negative qualifiers (-label:wontfix) are not parsed as flags.
+			args.push("--", ...tokenizeQuery(params.query));
+			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: "search", warnings: params.scope === "code" ? ["Code search has separate rate limits and may need extra scopes."] : undefined });
 			return result;
 		},
@@ -1249,7 +1290,7 @@ export default function (pi: ExtensionAPI): void {
 					addLimit(args, params.limit);
 					if (params.public) args.push("--public");
 					if (params.secret) args.push("--secret");
-					addJson(args, params.fields, gistDefaultFields);
+					addJson(args, params.fields, gistDefaultFields, params.jq);
 					break;
 				case "view":
 					if (!params.id) throw new Error("id is required for gist view to avoid gh prompts");
@@ -1281,7 +1322,7 @@ export default function (pi: ExtensionAPI): void {
 					if (params.dir) args.push(params.dir);
 					break;
 			}
-			const result = await execGh(pi, ctx, args);
+			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action });
 			return result;
 		},
