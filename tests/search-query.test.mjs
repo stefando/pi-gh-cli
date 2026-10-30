@@ -86,7 +86,7 @@ test('installed gh reconstructs phrase and qualifier quotes without network or a
     // the URL instead of launching a browser. fields='' suppresses --json below.
     const { stdout, stderr } = await execFileAsync(command, [...args.slice(0, 2), '--web', ...args.slice(2)], {
       cwd: tmpdir(), timeout: 5000,
-      env: { ...process.env, GH_HOST: 'github.com', GH_BROWSER: 'echo', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' },
+      env: { ...process.env, GH_HOST: 'github.com', GH_BROWSER: 'echo', GH_TOKEN: 'offline-test-token', GITHUB_TOKEN: '', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' },
     });
     return { stdout, stderr, code: 0 };
   });

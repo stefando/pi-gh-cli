@@ -1,17 +1,24 @@
-# pi-gh-cli
+# pi-gh-cli — personal fork
+
+> **Personal use only.** This is [stefando's fork](https://github.com/stefando/pi-gh-cli) of [tianrendong/pi-gh-cli](https://github.com/tianrendong/pi-gh-cli), modified for a personal pi setup. There is **no intention to publish this fork to npm or maintain it as a supported project**. No ongoing maintenance, updates, support, or compatibility guarantees are offered. The original MIT license is preserved.
 
 Structured GitHub CLI (`gh`) tools for Pi agents, exposed through **codemode** with a pre-execution confirmation **gate** for mutations.
 
-## Install
+## Install from this fork
+
+If the original npm extension is installed, remove it first to avoid loading both versions:
 
 ```bash
-pi install npm:pi-gh-cli
+pi remove npm:pi-gh-cli
+pi install git:github.com/stefando/pi-gh-cli@dev/gummi/gh-codemode
 ```
+
+Restart pi after replacing the installation. Confirm the configured source with `pi list`. Codemode must be enabled; for one session, use `pi --tools +codemode`.
 
 Or try without installing:
 
 ```bash
-pi -e npm:pi-gh-cli
+pi -e git:github.com/stefando/pi-gh-cli@dev/gummi/gh-codemode
 ```
 
 Requires GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/cli.md#enable-codemode) — the tools are registered with `codemode` exposure, so the model reaches them from codemode scripts rather than as declared tools.
@@ -142,4 +149,6 @@ For GitHub endpoints not covered by the specific tools, use `gh_api`.
 
 ## Development
 
-Run `npm run check` and `npm test`. The tests use Node's native TypeScript support (Node 22.18+ or a newer supported release). Gate tests use a mocked pi UI and do not execute GitHub mutations.
+For local development, use Node **22.19.0+** (pi's minimum), then run `npm install --ignore-scripts`, `npm run check`, and `npm test`. No build or npm publishing is required; install this fork directly from GitHub using the command above.
+
+The tests cover registration, mutation gating, argv construction, structured results, truncation, field discovery, and search tokenization. Gate/execution tests mock the pi API and UI. Two offline tests exercise the installed gh parser/query serializer without API calls, browser launches, or real credentials; they skip if gh is absent.

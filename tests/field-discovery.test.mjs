@@ -104,7 +104,7 @@ test('installed gh parser returns real fields without repo or network access', a
     try {
       const result = await execFileAsync(command, args, {
         cwd: tmpdir(),
-        env: { ...process.env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' },
+        env: { ...process.env, GH_TOKEN: 'offline-test-token', GITHUB_TOKEN: '', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' },
         timeout: 5000,
       });
       return { ...result, code: 0 };
