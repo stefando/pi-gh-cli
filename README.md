@@ -65,7 +65,7 @@ The object contains:
 
 - `data` — parsed JSON (including scalars and `null`), only when the output is complete JSON.
 - `text` — bounded output when JSON is unavailable or truncated. JSON is not duplicated into this field when `data` is present.
-- `exitCode` — process exit code. Ordinary command failures reject the call; `gh_auth_status` intentionally returns nonzero status here instead of throwing.
+- `exitCode` — process exit code. Ordinary command failures reject the call; `gh_auth_status` intentionally returns nonzero status here instead of throwing. Field discovery also returns gh's expected diagnostic exit code, `1`.
 - `actionClass` — `read` | `local_mutation` | `github_mutation` | `destructive`.
 - `warnings` — advisory strings, including possible list caps and API pagination warnings.
 - `nextSuggested` — hints for follow-up calls.
@@ -74,6 +74,19 @@ The object contains:
 - `stderr` — bounded stderr, when present.
 
 Direct calls still return formatted `content[0].text`, with warnings and hints appended, and rendering metadata in `details`. Raw argv is not included in the codemode object because it can contain sensitive arguments.
+
+### Discovering JSON fields
+
+Use `fields: "*"` on a supported read command:
+
+```js
+const result = await tools.gh_issue({ action: "view", fields: "*" });
+text(result.data.availableFields);
+```
+
+Discovery runs only `gh <resource> <action> --json`, locally. It ignores `jq`, comments, search queries, targets, and other operation options so they cannot interfere with parsing. No repository or issue/PR target is needed. The expected field-list diagnostic (gh exit code `1`) becomes a structured result; other errors still reject.
+
+Supported commands: issue list/view; PR list/view/checks; repo list/view; run list/view; workflow list; release list/view; label list; and all five search scopes, including code. Mutation commands and commands without JSON support (including `gist list` in the installed gh) reject discovery without executing the operation.
 
 ## Safety
 

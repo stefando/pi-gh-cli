@@ -34,7 +34,7 @@ const GH_NAMESPACE: ToolNamespace = {
 		"Prefer them over bash gh commands: arguments are validated, built as safe arg arrays (no shell quoting), and results are JSON with truncation handled.",
 		"Read actions (list/view/checks/diff/search/get) run without confirmation. Mutation and destructive actions are confirmed by the user in the TUI before execution; a declined call returns an error naming the declined operation.",
 		"Mutations require an explicit repo=OWNER/REPO and numeric issue/PR number; URLs and branch-inferred mutation targets are blocked. Repo create requires name=OWNER/REPO. Org/environment secrets and variables require explicit scope and org/env.",
-		"Use fields to select gh --json fields; sensible defaults apply when omitted. Pass fields='*' to list every available field for a command.",
+		"Use fields to select gh --json fields; sensible defaults apply when omitted. On supported read commands, fields='*' returns result.data.availableFields via local discovery (expected exitCode=1); other options are ignored and no repo or target is needed.",
 		"Use jq to shape or filter JSON output before it reaches context.",
 		"Independent calls can run in parallel: await Promise.all([tools.gh_issue({...}), tools.gh_pr({...})]).",
 	].join("\n"),
@@ -456,8 +456,8 @@ function addRepo(args: string[], repo?: string): void {
 
 function addJson(args: string[], fields?: string, fallback?: string, jq?: string): void {
 	const selected = fields ?? fallback;
-	if (selected === "*") args.push("--json");
-	else if (selected) args.push("--json", selected);
+	if (selected === "*") throw new Error("Field discovery must use the dedicated discovery path.");
+	if (selected) args.push("--json", selected);
 	if (jq && selected) args.push("--jq", jq);
 }
 
@@ -632,6 +632,37 @@ async function execGh(
 	return formatted;
 }
 
+/** Commands whose local --json diagnostic lists fields, before repository lookup or execution. */
+const DISCOVERY_ACTIONS: Record<string, readonly string[]> = {
+	issue: ["list", "view"],
+	pr: ["list", "view", "checks"],
+	repo: ["list", "view"],
+	run: ["list", "view"],
+	workflow: ["list"],
+	release: ["list", "view"],
+	label: ["list"],
+	search: ["repos", "issues", "prs", "code", "commits"],
+};
+
+async function discoverFields(pi: ExtensionAPI, ctx: ExtensionContext, resource: string, action: string) {
+	if (!DISCOVERY_ACTIONS[resource]?.includes(action)) {
+		throw new Error(`JSON field discovery is not supported for gh ${resource} ${action}. Choose a command with --json support.`);
+	}
+	// Bare --json must be last. Do not forward jq, query tokens, targets, or operation flags.
+	const args = [resource, action, "--json"];
+	const result = await pi.exec("gh", args, { cwd: ctx.cwd, signal: ctx.signal, timeout: COMMON_TIMEOUT_MS });
+	const diagnostic = result.stderr.trim() || result.stdout.trim();
+	const match = /^Specify one or more comma-separated fields for `--json`:\r?\n((?:[ \t]+[A-Za-z][A-Za-z0-9_]*\r?\n?)+)$/.exec(diagnostic);
+	if (result.code !== 1 || !match) {
+		throw new Error(diagnostic || `Unexpected gh field discovery response (exit ${result.code}).`);
+	}
+	const availableFields = match[1].trim().split(/\s+/);
+	const formatted = await formatResult(JSON.stringify({ availableFields }), "", args);
+	formatted.details.exitCode = result.code; // gh intentionally exits 1 for this diagnostic.
+	formatted.details.actionClass = "read";
+	return finalizeResult(formatted);
+}
+
 async function execGhAllowNonzero(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -713,6 +744,7 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: GhIssueParams,
 		async execute(_id, params: GhIssueParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "issue", params.action);
 			const args = ["issue", params.action.replace("_", "-")];
 			addRepo(args, params.repo);
 			switch (params.action) {
@@ -787,6 +819,7 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: GhPrParams,
 		async execute(_id, params: GhPrParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "pr", params.action);
 			const sub = params.action.replace("_", "-");
 			const args = ["pr", sub];
 			addRepo(args, params.repo);
@@ -901,6 +934,7 @@ export default function (pi: ExtensionAPI): void {
 		promptGuidelines: ["Use gh_repo instead of bash gh repo commands for repository metadata and settings."],
 		parameters: GhRepoParams,
 		async execute(_id, params: GhRepoParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "repo", params.action);
 			const args = ["repo", params.action === "default" ? "set-default" : params.action];
 			switch (params.action) {
 				case "view":
@@ -972,6 +1006,7 @@ export default function (pi: ExtensionAPI): void {
 		promptGuidelines: ["Use gh_run for Actions run lists, failed logs, reruns, and cancellation."],
 		parameters: GhRunParams,
 		async execute(_id, params: GhRunParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "run", params.action);
 			const args = ["run", params.action];
 			addRepo(args, params.repo);
 			switch (params.action) {
@@ -1047,6 +1082,7 @@ export default function (pi: ExtensionAPI): void {
 		promptGuidelines: ["Use gh_workflow for listing, viewing, dispatching, enabling, and disabling Actions workflows."],
 		parameters: GhWorkflowParams,
 		async execute(_id, params: GhWorkflowParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "workflow", params.action);
 			const args = ["workflow", params.action];
 			addRepo(args, params.repo);
 			switch (params.action) {
@@ -1137,6 +1173,7 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: GhReleaseParams,
 		async execute(_id, params: GhReleaseParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "release", params.action);
 			const sub = params.action;
 			const args = ["release", sub];
 			addRepo(args, params.repo);
@@ -1217,6 +1254,7 @@ export default function (pi: ExtensionAPI): void {
 		promptGuidelines: ["Use gh_label for label CRUD; do not parse human gh label list output."],
 		parameters: GhLabelParams,
 		async execute(_id, params: GhLabelParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "label", params.action);
 			const args = ["label", params.action];
 			addRepo(args, params.repo);
 			switch (params.action) {
@@ -1274,6 +1312,7 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: GhSearchParams,
 		async execute(_id, params: GhSearchParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "search", params.scope);
 			const args = ["search", params.scope];
 			addLimit(args, params.limit);
 			addRepeated(args, "--owner", params.owner);
@@ -1408,6 +1447,7 @@ export default function (pi: ExtensionAPI): void {
 		promptSnippet: "Structured GitHub gist operations via gh.",
 		parameters: GhGistParams,
 		async execute(_id, params: GhGistParamsT, _signal, _onUpdate, ctx) {
+			if (params.fields === "*") return discoverFields(pi, ctx, "gist", params.action);
 			const args = ["gist", params.action];
 			switch (params.action) {
 				case "list":
