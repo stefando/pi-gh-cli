@@ -25,7 +25,9 @@ Requires GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/
 - **Search queries** use gh's token model: qualifiers as separate tokens (`repo:cli/cli is:open`), double quotes mark phrases and multi-word qualifier values (`"broken feature"`, `label:"help wanted"`), negative qualifiers work (`-label:wontfix`); tokens are appended after `--` so they can never be parsed as flags.
 - **Pre-execution gate.** A `tool_call` handler classifies every call before `gh` runs:
   - reads (`list`/`view`/`checks`/`diff`/`search`/`get`, `gh_api` GET, `gh_search`, `gh_auth_status`) pass freely;
-  - mutations, local changes (`checkout`, `update_branch`, downloads/clones), and destructive actions (`delete`) are confirmed in the TUI with the exact tool, action, target, and repo; a decline blocks the call and returns `User declined: ...` to the model.
+  - mutations, local changes (`checkout`, `update_branch`, downloads/clones), and destructive actions (`delete`) require confirmation with scope and options (review verdict, merge flags, visibility, workflow inputs, file destinations, etc.); a decline blocks the call. Without a confirmation UI, mutations are blocked.
+  - repository mutations require `repo=OWNER/REPO` (or `HOST/OWNER/REPO`); issue/PR mutations require a numeric `number`, not a branch or URL. Repo creation requires `name=OWNER/REPO`. Organization/environment secrets and variables require an explicit scope and org/env. API mutations require literal endpoints without cwd-dependent placeholders.
+  - confirmation dialogs redact bodies, notes, API payloads and headers. Inspect those separately before approving; the dialog is not a payload review.
   - classification fails closed: an unknown action is treated as a mutation.
   - the gate fires for nested (codemode-script) calls too, since they go through the same `tool_call` handler.
 
@@ -76,7 +78,7 @@ From a codemode script, read before write:
 const pr = await tools.gh_pr({ action: "view", number: "42",
   fields: "number,title,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup,headRefOid" });
 // decide based on returned state; the merge will trigger the user confirmation gate
-const merged = await tools.gh_pr({ action: "merge", number: "42",
+const merged = await tools.gh_pr({ action: "merge", repo: "OWNER/REPO", number: "42",
   mergeMethod: "squash", matchHeadCommit: "<headRefOid>" });
 ```
 
@@ -95,3 +97,7 @@ Ask Pi:
 > Comment on issue #123 with this summary
 
 For GitHub endpoints not covered by the specific tools, use `gh_api`.
+
+## Development
+
+Run `npm run check` and `npm test`. The tests use Node's native TypeScript support (Node 22.18+ or a newer supported release). Gate tests use a mocked pi UI and do not execute GitHub mutations.

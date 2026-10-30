@@ -32,7 +32,7 @@ const GH_NAMESPACE: ToolNamespace = {
 		"Call these tools from codemode scripts: await tools.gh_pr({ action: 'view', number: '42' }).",
 		"Prefer them over bash gh commands: arguments are validated, built as safe arg arrays (no shell quoting), and results are JSON with truncation handled.",
 		"Read actions (list/view/checks/diff/search/get) run without confirmation. Mutation and destructive actions are confirmed by the user in the TUI before execution; a declined call returns an error naming the declined operation.",
-		"Pass repo=OWNER/REPO explicitly for any mutation outside the current git context.",
+		"Mutations require an explicit repo=OWNER/REPO and numeric issue/PR number; URLs and branch-inferred mutation targets are blocked. Repo create requires name=OWNER/REPO. Org/environment secrets and variables require explicit scope and org/env.",
 		"Use fields to select gh --json fields; sensible defaults apply when omitted. Pass fields='*' to list every available field for a command.",
 		"Use jq to shape or filter JSON output before it reaches context.",
 		"Independent calls can run in parallel: await Promise.all([tools.gh_issue({...}), tools.gh_pr({...})]).",
@@ -71,11 +71,69 @@ function classifyAction(action: string): "read" | "local_mutation" | "github_mut
  */
 function gateClass(toolName: string, input: Record<string, unknown>): "read" | "local_mutation" | "github_mutation" | "destructive" {
 	if (toolName === "gh_search" || toolName === "gh_auth_status") return "read";
+	if (toolName === "gh_run" && input.action === "watch") return "read";
+	if (toolName === "gh_repo" && input.action === "default" && !input.repo) return "read";
 	if (toolName === "gh_api") {
 		return (typeof input.method === "string" ? input.method : "GET") === "GET" ? "read" : "github_mutation";
 	}
 	const action = typeof input.action === "string" ? input.action : "";
 	return classifyAction(action);
+}
+
+/** Require deterministic mutation targets; never infer a repository or PR from cwd. */
+function mutationScope(toolName: string, input: Record<string, unknown>): string {
+	const required = (key: string): string => {
+		const value = input[key];
+		if (typeof value !== "string" || !value.trim()) throw new Error(`Pass an explicit ${key} for ${toolName} ${input.action ?? ""}.`);
+		return value;
+	};
+	if (toolName === "gh_api") {
+		const endpoint = required("endpoint");
+		if (endpoint.startsWith("-") || /\{(?:owner|repo|branch)\}/.test(endpoint)) {
+			throw new Error("API mutations require a literal endpoint without cwd-dependent placeholders or CLI flags.");
+		}
+		const host = /^https?:\/\//.test(endpoint) ? new URL(endpoint).host : input.hostname ?? process.env.GH_HOST ?? "github.com";
+		return `API host: ${host}; endpoint: ${endpoint}`;
+	}
+	if (toolName === "gh_gist") {
+		if (input.action !== "create") required("id");
+		return "Gist scope: authenticated account (not a repository)";
+	}
+	if ((toolName === "gh_secret" || toolName === "gh_variable") && input.scope === "organization") {
+		if (input.repo || input.env) throw new Error("Organization scope cannot be combined with repo or env.");
+		return `Organization: ${required("org")}`;
+	}
+	if (input.org) throw new Error("Pass scope=organization with org; org is ignored in other scopes.");
+	const repo = toolName === "gh_repo" && input.action === "create" ? required("name") : required("repo");
+	if (!/^(?:[\w.-]+\/)?[\w.-]+\/[\w.-]+$/.test(repo)) {
+		throw new Error("Mutation repository must be OWNER/REPO or HOST/OWNER/REPO (repo create requires an owner-qualified name).");
+	}
+	if ((toolName === "gh_pr" || toolName === "gh_issue") && input.action !== "create") {
+		// gh accepts cross-repo URLs even when --repo was supplied. Numeric targets remove that ambiguity.
+		if (!/^\d+$/.test(required("number"))) throw new Error("For mutations, pass a numeric issue/PR number and an explicit repo, not a URL or branch.");
+	}
+	if (toolName === "gh_workflow") required("workflow");
+	if (toolName === "gh_run") required("runId");
+	if (input.scope === "environment") return `Repository: ${repo}; environment: ${required("env")}`;
+	if (input.env) throw new Error("Pass scope=environment with env; env is ignored in other scopes.");
+	return `Repository: ${repo}`;
+}
+
+/** Show consequential options without exposing secret values, API payloads, or headers. */
+function confirmationOptions(toolName: string, input: Record<string, unknown>): string {
+	const options: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(input)) {
+		if (value === undefined || key === "confirm") continue;
+		if (key === "body" || key === "notes") {
+			options[key] = `[${String(value).length} characters; value not displayed]`;
+		} else if (toolName === "gh_api" && ["field", "rawField", "header"].includes(key)) {
+			options[key] = "[redacted; inspect payload separately before approving]";
+		} else {
+			options[key] = value;
+		}
+	}
+	if (toolName === "gh_pr" && input.action === "review" && !input.review) options.review = "comment (default)";
+	return JSON.stringify(options, null, 2);
 }
 
 function repoWarning(params: { repo?: string }, action: string): string | undefined {
@@ -567,21 +625,24 @@ export default function (pi: ExtensionAPI): void {
 	// is confirmed in the TUI before gh runs. Fires for direct and nested (codemode)
 	// calls alike, since both go through the tool_call handler.
 	pi.on("tool_call", async (event, ctx) => {
-		if (!event.toolName.startsWith("gh_")) return;
+		if (!["gh_issue", "gh_pr", "gh_repo", "gh_run", "gh_workflow", "gh_api", "gh_release", "gh_label", "gh_search", "gh_secret", "gh_variable", "gh_gist", "gh_auth_status"].includes(event.toolName)) return;
 		const input = event.input as Record<string, unknown>;
 		const cls = gateClass(event.toolName, input);
 		if (cls === "read") return;
-		const action = typeof input.action === "string" ? input.action : typeof input.method === "string" ? input.method : "";
-		const target = [input.number, input.runId, input.workflow, input.tag, input.name, input.id, input.endpoint].find(
-			(v): v is string => typeof v === "string" && v !== "",
-		);
-		const repo = typeof input.repo === "string" ? input.repo : "current repo context";
-		const summary = `${event.toolName} ${action}${target ? ` ${target}` : ""} (${repo})`.trim();
+		let scope: string;
+		try {
+			scope = mutationScope(event.toolName, input);
+		} catch (error) {
+			return { block: true, reason: error instanceof Error ? error.message : "Cannot determine mutation scope." };
+		}
+		if (!ctx.hasUI) return { block: true, reason: "Mutation blocked: no UI available for confirmation." };
+		const action = String(input.action ?? input.method ?? "GET");
+		const summary = `${event.toolName} ${action}\n${scope}`;
 		const title =
 			cls === "destructive" ? "Destructive GitHub operation" :
 			cls === "local_mutation" ? "Local repository change" :
 			"GitHub mutation";
-		const ok = await ctx.ui.confirm(title, `Allow: ${summary}`);
+		const ok = await ctx.ui.confirm(title, `Allow: ${summary}\n\n${confirmationOptions(event.toolName, input)}`, { signal: ctx.signal });
 		if (!ok) return { block: true, reason: `User declined: ${summary}` };
 	});
 
