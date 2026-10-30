@@ -30,6 +30,7 @@ const GH_NAMESPACE: ToolNamespace = {
 		"Structured GitHub CLI (gh) tools: issues, pull requests, repos, Actions runs and workflows, releases, labels, search, secrets, variables, gists, raw REST/GraphQL API, and auth status.",
 	instructions: [
 		"Call these tools from codemode scripts: await tools.gh_pr({ action: 'view', number: '42' }).",
+		"Calls resolve to objects: inspect result.data (complete JSON) or result.text (plain/truncated output), plus result.warnings, exitCode, nextSuggested, truncated and fullOutputPath. Do not JSON.parse the result. Truncated output omits data; read fullOutputPath if needed.",
 		"Prefer them over bash gh commands: arguments are validated, built as safe arg arrays (no shell quoting), and results are JSON with truncation handled.",
 		"Read actions (list/view/checks/diff/search/get) run without confirmation. Mutation and destructive actions are confirmed by the user in the TUI before execution; a declined call returns an error naming the declined operation.",
 		"Mutations require an explicit repo=OWNER/REPO and numeric issue/PR number; URLs and branch-inferred mutation targets are blocked. Repo create requires name=OWNER/REPO. Org/environment secrets and variables require explicit scope and org/env.",
@@ -514,6 +515,55 @@ function targetText(value: string | undefined): string {
 	return value;
 }
 
+const GhOutputSchema = Type.Object({
+	data: Type.Optional(Type.Unknown({ description: "Parsed JSON; omitted when output was truncated or is not JSON." })),
+	text: Type.Optional(Type.String({ description: "Bounded text output, present when data is omitted." })),
+	exitCode: Type.Integer(),
+	actionClass: StringEnum(["read", "local_mutation", "github_mutation", "destructive"] as const),
+	warnings: Type.Array(Type.String()),
+	nextSuggested: Type.Array(Type.String()),
+	truncated: Type.Boolean(),
+	fullOutputPath: Type.Optional(Type.String()),
+	stderr: Type.Optional(Type.String({ description: "Bounded stderr, if any." })),
+});
+
+type JsonData = null | boolean | number | string | JsonData[] | { [key: string]: JsonData };
+type GhResult = { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> };
+
+/** Run after enrichment so codemode receives the same final metadata as direct callers. */
+function finalizeResult(result: GhResult) {
+	const { details } = result;
+	const truncated = Boolean(details.truncation);
+	const warnings = (details.warnings as string[] | undefined) ?? [];
+	const nextSuggested = (details.nextSuggested as string[] | undefined) ?? [];
+	const structuredContent: {
+		data?: JsonData; text?: string; exitCode: number; actionClass: string;
+		warnings: string[]; nextSuggested: string[]; truncated: boolean;
+		fullOutputPath?: string; stderr?: string;
+	} = {
+		exitCode: typeof details.exitCode === "number" ? details.exitCode : 0,
+		actionClass: String(details.actionClass ?? "github_mutation"),
+		warnings, nextSuggested, truncated,
+	};
+	if (!truncated && details.parsed !== undefined) {
+		// JSON.parse was performed in formatResult. Never expose this unbounded value after truncation.
+		structuredContent.data = details.parsed as JsonData;
+	} else {
+		structuredContent.text = result.content[0].text;
+	}
+	if (typeof details.fullOutputPath === "string") structuredContent.fullOutputPath = details.fullOutputPath;
+	if (typeof details.stderr === "string") {
+		structuredContent.stderr = truncateTail(details.stderr, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES }).content;
+	}
+	// Direct tool declarations still work when explicitly activated. Include advisory metadata there too.
+	const advisory = [
+		...warnings.map((warning) => `Warning: ${warning}`),
+		...nextSuggested.map((suggestion) => `Next: ${suggestion}`),
+	];
+	if (advisory.length) result.content[0].text += `\n\n${advisory.join("\n")}`;
+	return { ...result, structuredContent };
+}
+
 async function formatResult(
 	stdout: string,
 	stderr: string,
@@ -572,6 +622,7 @@ async function execGh(
 		throw new Error(message);
 	}
 	const formatted = await formatResult(result.stdout, result.stderr, args, options.mode);
+	formatted.details.exitCode = result.code;
 	// List commands cap results silently and expose no totalCount; flag the likely-truncation case.
 	if (options.limit !== undefined && Array.isArray(formatted.details.parsed) && formatted.details.parsed.length >= options.limit) {
 		const warnings = [...((formatted.details.warnings as string[] | undefined) ?? [])];
@@ -650,6 +701,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_issue",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub issue",
 		description:
 			"Structured GitHub issue operations via gh. Supports list/view/create/comment/edit/close/reopen. Uses gh --json where possible. Output truncated to " +
@@ -711,7 +763,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhIssueParamsT>, theme) {
 			return renderGhCall("gh_issue", args.action, args.number)(theme);
@@ -723,6 +775,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_pr",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub PR",
 		description:
 			"Structured GitHub pull request operations via gh. Supports list/view/checks/diff/create/comment/review/merge/close/reopen/ready/checkout/update_branch. Uses gh --json where possible. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
@@ -829,7 +882,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args, { mode: params.action === "diff" ? "tail" : "head", limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo, nextSuggested });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhPrParamsT>, theme) {
 			return renderGhCall("gh_pr", args.action, args.number)(theme);
@@ -841,6 +894,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_repo",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub repo",
 		description: "Structured GitHub repository operations via gh. Supports view/list/default/create/edit. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub repository operations via gh.",
@@ -899,7 +953,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhRepoParamsT>, theme) {
 			return renderGhCall("gh_repo", args.action, args.repo)(theme);
@@ -911,6 +965,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_run",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub Actions run",
 		description: "Structured GitHub Actions run operations via gh. Supports list/view/watch/rerun/cancel/download. Logs are tail-truncated; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub Actions run operations via gh.",
@@ -973,7 +1028,7 @@ export default function (pi: ExtensionAPI): void {
 				limit: params.limit,
 			});
 			enrichEnvelope(result, { action: params.action, repo: params.repo, nextSuggested });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhRunParamsT>, theme) {
 			return renderGhCall("gh_run", args.action, args.runId)(theme);
@@ -985,6 +1040,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_workflow",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub workflow",
 		description: "Structured GitHub Actions workflow operations via gh. Supports list/view/run/enable/disable. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub workflow operations via gh.",
@@ -1017,7 +1073,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args, { mode: "head", limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhWorkflowParamsT>, theme) {
 			return renderGhCall("gh_workflow", args.action, args.workflow)(theme);
@@ -1029,6 +1085,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_api",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub API",
 		description:
 			"Structured gh api wrapper. Builds argument arrays (no shell quoting), supports method/fields/headers/previews/pagination/jq/cache. Non-GET methods are confirmed in the TUI before execution.",
@@ -1058,7 +1115,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			result.details.actionClass = method === "GET" ? "read" : "github_mutation";
 			if (warnings.length) result.details.warnings = warnings;
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhApiParamsT>, theme) {
 			return renderGhCall("gh_api", args.method ?? "GET", args.endpoint)(theme);
@@ -1070,6 +1127,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_release",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub release",
 		description: "Structured GitHub release operations via gh. Supports list/view/create/edit/delete/upload/download. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub release operations via gh.",
@@ -1140,7 +1198,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: sub, repo: params.repo });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhReleaseParamsT>, theme) {
 			return renderGhCall("gh_release", args.action, args.tag)(theme);
@@ -1152,6 +1210,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_label",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub label",
 		description: "Structured GitHub label operations via gh. Supports list/create/edit/delete/clone. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub label operations via gh.",
@@ -1192,7 +1251,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhLabelParamsT>, theme) {
 			return renderGhCall("gh_label", args.action, args.name)(theme);
@@ -1204,6 +1263,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_search",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		annotations: { readOnlyHint: true },
 		label: "GitHub search",
 		description: "Structured gh search wrapper across repos/issues/prs/code/commits. Read-only; uses gh --json fields where supported.",
@@ -1237,7 +1297,7 @@ export default function (pi: ExtensionAPI): void {
 			args.push("--", ...tokenizeQuery(params.query));
 			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: "search", warnings: params.scope === "code" ? ["Code search has separate rate limits and may need extra scopes."] : undefined });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhSearchParamsT>, theme) {
 			return renderGhCall("gh_search", args.scope, args.query)(theme);
@@ -1249,6 +1309,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_secret",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub secret",
 		description: "Structured GitHub Actions/Codespaces/Dependabot secret operations via gh. Supports list/set/delete. Values are write-only; reads are not possible.",
 		promptSnippet: "Structured GitHub secret operations via gh.",
@@ -1283,7 +1344,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args);
 			enrichEnvelope(result, { action: params.action, repo: params.repo, warnings: ["Secret values cannot be read back via gh."] });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhSecretParamsT>, theme) {
 			return renderGhCall("gh_secret", args.action, args.name)(theme);
@@ -1295,6 +1356,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_variable",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub variable",
 		description: "Structured GitHub Actions variable operations via gh. Supports list/get/set/delete.",
 		promptSnippet: "Structured GitHub variable operations via gh.",
@@ -1328,7 +1390,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args);
 			enrichEnvelope(result, { action: params.action, repo: params.repo });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhVariableParamsT>, theme) {
 			return renderGhCall("gh_variable", args.action, args.name)(theme);
@@ -1340,6 +1402,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_gist",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		label: "GitHub gist",
 		description: "Structured GitHub gist operations via gh. Supports list/view/create/edit/delete/clone. Read actions run freely; mutation and destructive actions are confirmed in the TUI before execution.",
 		promptSnippet: "Structured GitHub gist operations via gh.",
@@ -1385,7 +1448,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const result = await execGh(pi, ctx, args, { limit: params.limit });
 			enrichEnvelope(result, { action: params.action });
-			return result;
+			return finalizeResult(result);
 		},
 		renderCall(args: Partial<GhGistParamsT>, theme) {
 			return renderGhCall("gh_gist", args.action, args.id)(theme);
@@ -1397,6 +1460,7 @@ export default function (pi: ExtensionAPI): void {
 		name: "gh_auth_status",
 		exposure: "codemode",
 		namespace: GH_NAMESPACE,
+		outputSchema: GhOutputSchema,
 		annotations: { readOnlyHint: true },
 		label: "GitHub auth status",
 		description: "Read-only gh auth status wrapper. Never shows tokens.",
@@ -1409,7 +1473,9 @@ export default function (pi: ExtensionAPI): void {
 			const args = ["auth", "status"];
 			if (params.hostname) args.push("--hostname", params.hostname);
 			if (params.active) args.push("--active");
-			return execGhAllowNonzero(pi, ctx, args);
+			const result = await execGhAllowNonzero(pi, ctx, args);
+			result.details.actionClass = "read";
+			return finalizeResult(result);
 		},
 		renderCall(_args, theme) {
 			return renderGhCall("gh_auth_status", undefined)(theme);

@@ -49,15 +49,31 @@ Requires GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/
 
 ## Result envelope
 
-Each tool returns:
+All tools declare an output schema. **Codemode calls resolve to an object**, not a JSON string:
 
-- `content[0].text` — formatted stdout (JSON pretty-printed when possible)
-- `details.command` — full `gh` argv
-- `details.parsed` — parsed JSON if applicable
-- `details.actionClass` — `read` | `local_mutation` | `github_mutation` | `destructive`
-- `details.warnings` — e.g. missing repo on mutation, unread pagination
-- `details.nextSuggested` — hints for follow-up calls
-- `details.fullOutputPath` — set when truncated
+```js
+const result = await tools.gh_pr({ action: "list", repo: "OWNER/REPO", fields: "number,title" });
+if (result.truncated) {
+  text({ text: result.text, fullOutputPath: result.fullOutputPath });
+} else {
+  text(result.data);
+}
+text(result.warnings);
+```
+
+The object contains:
+
+- `data` — parsed JSON (including scalars and `null`), only when the output is complete JSON.
+- `text` — bounded output when JSON is unavailable or truncated. JSON is not duplicated into this field when `data` is present.
+- `exitCode` — process exit code. Ordinary command failures reject the call; `gh_auth_status` intentionally returns nonzero status here instead of throwing.
+- `actionClass` — `read` | `local_mutation` | `github_mutation` | `destructive`.
+- `warnings` — advisory strings, including possible list caps and API pagination warnings.
+- `nextSuggested` — hints for follow-up calls.
+- `truncated` — whether stdout was truncated. If true, `data` is omitted so full JSON cannot bypass the output limit.
+- `fullOutputPath` — path to complete stdout when truncated.
+- `stderr` — bounded stderr, when present.
+
+Direct calls still return formatted `content[0].text`, with warnings and hints appended, and rendering metadata in `details`. Raw argv is not included in the codemode object because it can contain sensitive arguments.
 
 ## Safety
 
