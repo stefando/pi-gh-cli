@@ -22,7 +22,7 @@ Requires GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/
 - **Called from scripts.** `await tools.gh_pr({ action: "view", number: "42" })`. Independent calls can run in parallel with `Promise.all`.
 - **Validation and safe argv.** Arguments are validated against TypeBox schemas and built into `gh` arg arrays — no shell quoting, no interactive prompts (`GH_PROMPT_DISABLED=1`, required flags enforced).
 - **Output shaping.** Every `--json` command accepts `jq` (applied by gh before output reaches context) and `fields`; pass `fields='*'` to list all available fields for a command. List results that come back exactly at `limit` get a truncation warning, since gh caps lists silently.
-- **Search queries** use gh's token model: qualifiers as separate tokens (`repo:cli/cli is:open`), double quotes mark phrases and multi-word qualifier values (`"broken feature"`, `label:"help wanted"`), negative qualifiers work (`-label:wontfix`); tokens are appended after `--` so they can never be parsed as flags.
+- **Search queries** use gh's token model: qualifiers as separate tokens (`repo:cli/cli is:open`), double quotes group phrases and multi-word qualifier values (`"broken feature"`, `label:"help wanted"`), negative qualifiers work (`-label:wontfix`); tokens are appended after `--` so they can never be parsed as flags. A state-machine tokenizer handles escaping and rejects malformed quotes before executing gh.
 - **Pre-execution gate.** A `tool_call` handler classifies every call before `gh` runs:
   - reads (`list`/`view`/`checks`/`diff`/`search`/`get`, `gh_api` GET, `gh_search`, `gh_auth_status`) pass freely;
   - mutations, local changes (`checkout`, `update_branch`, downloads/clones), and destructive actions (`delete`) require confirmation with scope and options (review verdict, merge flags, visibility, workflow inputs, file destinations, etc.); a decline blocks the call. Without a confirmation UI, mutations are blocked.
@@ -74,6 +74,19 @@ The object contains:
 - `stderr` — bounded stderr, when present.
 
 Direct calls still return formatted `content[0].text`, with warnings and hints appended, and rendering metadata in `details`. Raw argv is not included in the codemode object because it can contain sensitive arguments.
+
+### Search-query notation
+
+`query` is not a shell command. Double quotes group text into a single gh argument; gh then quotes that argument when building its search string. Use `\"` for a literal double quote and `\\` for a literal backslash. Other backslashes are preserved. Single quotes and shell expressions are literal text, not shell quoting or expansion.
+
+```js
+await tools.gh_search({
+  scope: "issues",
+  query: String.raw`repo:cli/cli "say \"hello\"" label:"help wanted" -label:wontfix`,
+});
+```
+
+Unquoted parentheses become separate grouping tokens, so `(repo:o/a OR repo:o/b)` works with gh's advanced issue search. Quotes must be balanced, and empty quoted terms/qualifier values are rejected rather than silently changed. An empty or whitespace-only query can be used for flag-only searches (for example, with `owner`). This notation does not validate every GitHub search-language rule; gh and GitHub still enforce those.
 
 ### Discovering JSON fields
 

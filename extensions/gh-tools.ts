@@ -386,7 +386,7 @@ type GhLabelParamsT = Static<typeof GhLabelParams>;
 
 const GhSearchParams = Type.Object({
 	scope: StringEnum(ghSearchScopes),
-	query: Type.String({ description: "GitHub search query: qualifiers as separate tokens (repo:cli/cli is:open); double-quote phrases and multi-word qualifier values (\"broken feature\", label:\"help wanted\"). Negative qualifiers like -label:wontfix are supported." }),
+	query: Type.String({ description: 'GitHub search query, not a shell command. Double quotes group phrases and qualifier values ("broken feature", label:"help wanted"); backslash escapes a double quote or backslash. Unquoted parentheses are separate grouping tokens. Negative qualifiers like -label:wontfix are supported. Unmatched quotes and empty quoted terms are rejected.' }),
 	limit: Type.Optional(Type.Number()),
 	fields: Type.Optional(Type.String({ description: JSON_HELP })),
 	jq: Type.Optional(Type.String({ description: JQ_HELP })),
@@ -469,13 +469,52 @@ function viewFields(fields: string | undefined, comments: boolean | undefined, d
 }
 
 /**
- * Splits a search query into argv tokens. gh treats each positional argument as one keyword or
- * qualifier and re-quotes it when building the search string, so double quotes mark phrase
- * boundaries here and are stripped (gh adds them back): `repo:cli/cli is:open "broken feature"
- * label:"help wanted"` -> [`repo:cli/cli`, `is:open`, `broken feature`, `label:help wanted`].
+ * Parse our query notation, not shell syntax. gh re-quotes each argv keyword/qualifier
+ * when constructing the API query. Keep phrases together while decoding escaped quotes
+ * and backslashes; preserve all other backslashes and never expand shell expressions.
  */
 function tokenizeQuery(query: string): string[] {
-	return [...query.matchAll(/[\w./-]+:"[^"]*"|"[^"]*"|\S+/g)].map((m) => m[0].replace(/"([^"]*)"/g, "$1"));
+	const tokens: string[] = [];
+	let token = "";
+	let quoted = false;
+	let started = false;
+	let quoteStart = -1;
+	let quoteValueStart = 0;
+	const flush = () => {
+		if (started) {
+			if (!token.trim()) throw new Error("Search query contains an empty term.");
+			tokens.push(token);
+		}
+		token = "";
+		started = false;
+	};
+	for (let i = 0; i < query.length; i++) {
+		const char = query[i];
+		if (char === "\\" && (query[i + 1] === '"' || query[i + 1] === "\\")) {
+			token += query[++i];
+			started = true;
+		} else if (char === '"') {
+			if (!quoted) {
+				quoteStart = i;
+				quoteValueStart = token.length;
+			} else if (!token.slice(quoteValueStart).trim()) {
+				throw new Error("Search query contains an empty quoted term or qualifier value.");
+			}
+			quoted = !quoted;
+			started = true;
+		} else if (!quoted && /\s/.test(char)) {
+			flush();
+		} else if (!quoted && (char === "(" || char === ")")) {
+			flush();
+			tokens.push(char);
+		} else {
+			token += char;
+			started = true;
+		}
+	}
+	if (quoted) throw new Error(`Unmatched double quote in search query at character ${quoteStart + 1}.`);
+	flush();
+	return tokens;
 }
 
 function addLimit(args: string[], limit?: number): void {
