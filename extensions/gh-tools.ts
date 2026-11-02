@@ -9,9 +9,8 @@ import {
 	truncateHead,
 	truncateTail,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TUnsafe } from "typebox";
 
 const COMMON_TIMEOUT_MS = 30_000;
 const COMMON_REPO_HELP = "Repository in [HOST/]OWNER/REPO format. Defaults to current gh/git context.";
@@ -179,6 +178,23 @@ const prViewDefaultFields = "number,title,state,isDraft,author,baseRefName,headR
 const repoDefaultFields = "nameWithOwner,description,visibility,isPrivate,isArchived,defaultBranchRef,primaryLanguage,repositoryTopics,stargazerCount,forkCount,url";
 const runDefaultFields = "databaseId,number,name,displayTitle,workflowName,event,status,conclusion,headBranch,headSha,createdAt,updatedAt,url";
 const workflowDefaultFields = "id,name,path,state";
+
+/**
+ * Plain `{ type: "string", enum: [...] }` schema typed for TypeBox's Static.
+ * Matches the StringEnum that Pi's extension view exposes for
+ * `@earendil-works/pi-ai` in 1.5+, without depending on its published types.
+ */
+function StringEnum<T extends readonly string[]>(
+	values: T,
+	options?: { description?: string; default?: T[number] },
+): TUnsafe<T[number]> {
+	return Type.Unsafe<T[number]>({
+		type: "string",
+		enum: values,
+		...(options?.description && { description: options.description }),
+		...(options?.default && { default: options.default }),
+	});
+}
 
 const KeyValueParam = Type.Object({
 	key: Type.String(),

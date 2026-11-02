@@ -21,13 +21,13 @@ Or try without installing:
 pi -e git:github.com/stefando/pi-gh-cli@dev/gummi/gh-codemode
 ```
 
-Requires GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/cli.md#enable-codemode) — the tools are registered with `codemode` exposure, so the model reaches them from codemode scripts rather than as declared tools.
+Requires pi 1.5+, GitHub CLI (`gh auth login`) and [codemode enabled](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/cli.md#enable-codemode) — the tools are registered with `codemode` exposure, so the model reaches them from codemode scripts rather than as declared tools.
 
 ## How it works
 
 - **Near-zero context cost.** The 13 tools are not declared in the system prompt. They are listed under the `gh` namespace in the codemode description and discoverable via `searchTools()` / `describeTool()` / `describeNamespace("gh")`.
 - **Called from scripts.** `await tools.gh_pr({ action: "view", number: "42" })`. Independent calls can run in parallel with `Promise.all`.
-- **Validation and safe argv.** Arguments are validated against TypeBox schemas and built into `gh` arg arrays — no shell quoting, no interactive prompts (`GH_PROMPT_DISABLED=1`, required flags enforced).
+- **Validation and safe argv.** Arguments are validated as JSON Schema built with TypeBox and built into `gh` arg arrays — no shell quoting, no interactive prompts (`GH_PROMPT_DISABLED=1`, required flags enforced).
 - **Output shaping.** Every `--json` command accepts `jq` (applied by gh before output reaches context) and `fields`; pass `fields='*'` to list all available fields for a command. List results that come back exactly at `limit` get a truncation warning, since gh caps lists silently.
 - **Search queries** use gh's token model: qualifiers as separate tokens (`repo:cli/cli is:open`), double quotes group phrases and multi-word qualifier values (`"broken feature"`, `label:"help wanted"`), negative qualifiers work (`-label:wontfix`); tokens are appended after `--` so they can never be parsed as flags. A state-machine tokenizer handles escaping and rejects malformed quotes before executing gh.
 - **Pre-execution gate.** A `tool_call` handler classifies every call before `gh` runs:
